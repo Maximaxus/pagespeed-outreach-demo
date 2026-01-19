@@ -17,6 +17,16 @@ if not API_KEY:
     st.warning("Missing PAGESPEED_API_KEY. Add it in Streamlit Cloud → App settings → Secrets.")
     st.stop()
 
+# ---------------------------
+# Session state (persist downloads across reruns)
+# ---------------------------
+if "res_df" not in st.session_state:
+    st.session_state["res_df"] = None
+if "results_xlsx_bytes" not in st.session_state:
+    st.session_state["results_xlsx_bytes"] = None
+if "snov_csv_bytes" not in st.session_state:
+    st.session_state["snov_csv_bytes"] = None
+
 CANON = ["website", "email", "name", "company", "linkedin"]
 
 SYNONYMS = {
@@ -133,10 +143,7 @@ def decision_and_email(perf: int | None, name: str | None):
 
     # greeting fallback
     greet_name = (name or "").strip()
-    if not greet_name:
-        greet = "Hi there,"
-    else:
-        greet = f"Hi {greet_name},"
+    greet = f"Hi {greet_name}," if greet_name else "Hi there,"
 
     # Template buckets
     if perf <= 50:
@@ -186,9 +193,11 @@ def read_any(uploaded) -> pd.DataFrame:
     name = (uploaded.name or "").lower()
     if name.endswith(".csv"):
         return pd.read_csv(uploaded)
-    # xlsx/xls
     return pd.read_excel(uploaded)
 
+# ---------------------------
+# UI
+# ---------------------------
 st.subheader("1) Upload file")
 st.write("Supported: **CSV, XLSX**. We'll auto-detect columns and you can adjust mapping if needed.")
 uploaded = st.file_uploader("Upload CSV/XLSX", type=["csv", "xlsx", "xls"])
@@ -196,15 +205,21 @@ uploaded = st.file_uploader("Upload CSV/XLSX", type=["csv", "xlsx", "xls"])
 rate_sleep = st.slider("Delay between checks (seconds)", 0.0, 3.0, 1.0, 0.5)
 max_rows = st.number_input("Max rows to process", min_value=1, max_value=5000, value=200, step=50)
 
+col_clear, _ = st.columns([1, 3])
+with col_clear:
+    if st.button("Clear results"):
+        st.session_state["res_df"] = None
+        st.session_state["results_xlsx_bytes"] = None
+        st.session_state["snov_csv_bytes"] = None
+        st.success("Cleared. Upload and run analysis again.")
+
 if uploaded:
     df_raw = read_any(uploaded)
-    # keep original column names, but also create a normalized view for matching
     df_raw = df_raw.head(int(max_rows)).copy()
 
     st.subheader("2) Preview (raw)")
     st.dataframe(df_raw.head(50), use_container_width=True)
 
-    # Auto mapping
     mapping_auto = auto_map_columns(df_raw)
 
     st.subheader("3) Column mapping")
@@ -229,7 +244,6 @@ if uploaded:
 
     finalized = {k: (None if v == "(none)" else v) for k, v in mapping_ui.items()}
 
-    # Build canonical df
     df = pd.DataFrame()
     df["website"] = df_raw[finalized["website"]].astype(str) if finalized["website"] else ""
     df["email"] = df_raw[finalized["email"]].astype(str) if finalized["email"] else ""
@@ -287,16 +301,12 @@ if uploaded:
 
         res = pd.DataFrame(results)
 
-        st.subheader("5) Results (full)")
-        st.dataframe(res, use_container_width=True)
-
-        # Export #1: results.xlsx (full)
+        # Build exports -> bytes (store in session_state)
         xlsx_buf = io.BytesIO()
         with pd.ExcelWriter(xlsx_buf, engine="openpyxl") as writer:
             res.to_excel(writer, index=False, sheet_name="results")
-        xlsx_buf.seek(0)
+        results_xlsx_bytes = xlsx_buf.getvalue()
 
-        # Export #2: snov_import.csv (only send)
         snov = res[res["decision"] == "send"].copy()
         snov_out = pd.DataFrame({
             "email": snov["email"],
@@ -309,12 +319,31 @@ if uploaded:
             "email_body": snov["email_body"],
             "audit_note": snov["audit_note"],
         })
+        snov_csv_bytes = snov_out.to_csv(index=False).encode("utf-8")
 
-        csv_buf = io.BytesIO()
-        snov_out.to_csv(csv_buf, index=False)
-        csv_buf.seek(0)
+        st.session_state["res_df"] = res
+        st.session_state["results_xlsx_bytes"] = results_xlsx_bytes
+        st.session_state["snov_csv_bytes"] = snov_csv_bytes
 
-        st.download_button("Download results.xlsx", data=xlsx_buf, file_name="results.xlsx")
-        st.download_button("Download snov_import.csv", data=csv_buf, file_name="snov_import.csv")
+        st.success("Done. Downloads are available below (you can download both).")
 
-        st.success("Done.")
+# ---------------------------
+# Persistent results + downloads (works across reruns)
+# ---------------------------
+if st.session_state["res_df"] is not None:
+    st.subheader("5) Results (full)")
+    st.dataframe(st.session_state["res_df"], use_container_width=True)
+
+    st.subheader("Downloads")
+    st.download_button(
+        "Download results.xlsx",
+        data=st.session_state["results_xlsx_bytes"],
+        file_name="results.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    st.download_button(
+        "Download snov_import.csv",
+        data=st.session_state["snov_csv_bytes"],
+        file_name="snov_import.csv",
+        mime="text/csv",
+    )
